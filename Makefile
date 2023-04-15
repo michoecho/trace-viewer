@@ -1,4 +1,4 @@
-CXXFLAGS = -O2 -g -I $(IMGUI_DIR)/include/imgui -I implot -std=c++20
+CXXFLAGS = -O2 -g -I $(IMGUI_DIR)/include/imgui -I implot -std=c++20 -Wall -Wextra -Wno-missing-field-initializers
 LDLIBS = -lglfw -lGL -lm -lfmt
 all: main
 
