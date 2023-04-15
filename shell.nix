@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs-unstable> {} }:
+{ pkgs ? import <nixpkgs> {} }:
 
 pkgs.mkShell {
   name = "Scylla trace viewer";
