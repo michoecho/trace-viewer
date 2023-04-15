@@ -1,5 +1,5 @@
 CXXFLAGS = -O2 -g -I $(IMGUI_DIR)/include/imgui -I implot -std=c++20
-LDLIBS = -lglfw -lGL -lm
+LDLIBS = -lglfw -lGL -lm -lfmt
 all: main
 
 imgui_impl%.o: $(IMGUI_DIR)/include/imgui/backends/imgui_impl%.cpp

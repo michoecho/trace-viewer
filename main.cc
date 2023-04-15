@@ -1,8 +1,3 @@
-// Dear ImGui: standalone example application for GLFW + OpenGL 3, using programmable pipeline
-// (GLFW is a cross-platform general purpose library for handling windows, inputs, OpenGL/Vulkan/Metal graphics context creation, etc.)
-// If you are new to Dear ImGui, read documentation from the docs/ folder + read the top of imgui.cpp.
-// Read online: https://github.com/ocornut/imgui/tree/master/docs
-
 #include <implot.h>
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_glfw.h>
@@ -15,38 +10,52 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <span>
+#include <functional>
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <cerrno>
+#include <atomic>
 #include <stdexcept>
 #include <system_error>
-#include <fmt/core.hh>
-#define GL_SILENCE_DEPRECATION
-#if defined(IMGUI_IMPL_OPENGL_ES2)
-#include <GLES2/gl2.h>
-#endif
+#include <fmt/core.h>
+#include <fmt/ranges.h>
 #include <GLFW/glfw3.h> // Will drag system OpenGL headers
 
-// [Win32] Our example includes a copy of glfw3.lib pre-compiled with VS2010 to maximize ease of testing and compatibility with old VS compilers.
-// To link with VS2010-era libraries, VS2015+ requires linking with legacy_stdio_definitions.lib, which we do using this pragma.
-// Your own project should not be affected, as you are likely to link with a newer binary of GLFW that is adequate for your version of Visual Studio.
-#if defined(_MSC_VER) && (_MSC_VER >= 1900) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS)
-#pragma comment(lib, "legacy_stdio_definitions")
-#endif
+const double MULTIPLIER = 0.2941171840072451;
 
-// This example can also compile and run with Emscripten! See 'Makefile.emscripten' for details.
-#ifdef __EMSCRIPTEN__
-#include "../libs/emscripten/emscripten_mainloop_stub.h"
-#endif
+inline int64_t rdtsc() {
+    uint64_t rax, rdx;
+    asm volatile ( "rdtsc" : "=a" (rax), "=d" (rdx) );
+    return (int64_t)(( rdx << 32 ) + rax);
+}
 
-static void glfw_error_callback(int error, const char* description)
-{
+static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+struct entry {
+    uint64_t event;
+    uint64_t id;
+    uint64_t arg;
+    int64_t ts;
 
-// Main code
-int main(int argc, char** argv)
-{
+    uint64_t query() const {
+        if (event == 0 || event == 1 || event == 0xa || event == 0xb) {
+            return arg;
+        } else {
+            return id;
+        }
+    }
+};
+template <> struct fmt::formatter<entry> : formatter<string_view> {
+    auto format(const entry& e, auto& ctx) const -> decltype(ctx.out()) {
+        // ctx.out() is an output iterator to write to.
+        return fmt::format_to(ctx.out(), "({:016x} {:016x} {:016x} {:016x})", e.event, e.id, e.arg, e.ts);
+    }
+};
+
+int main(int argc, char** argv) {
     if (argc == 1) {
         throw std::runtime_error("USAGE: ./main FILE");
     }
@@ -57,12 +66,6 @@ int main(int argc, char** argv)
     fd = open(argv[1], O_RDONLY);
     fstat(fd, &sb);
     size_t file_size = sb.st_size;
-    struct entry {
-        uint64_t event;
-        uint64_t id;
-        uint64_t arg;
-        int64_t ts;
-    };
     memblock = (char*)mmap(nullptr, file_size, PROT_WRITE | PROT_READ, MAP_PRIVATE, fd, 0);
     if (memblock == MAP_FAILED) {
         throw std::system_error(errno, std::generic_category(), argv[1]);
@@ -70,37 +73,150 @@ int main(int argc, char** argv)
     size_t n_entries = file_size / sizeof(entry);
     auto span = std::span<const entry>(reinterpret_cast<const entry*>(memblock), n_entries);
     auto sorted = std::vector<entry>(span.begin(), span.end());
-    std::ranges::sort(sorted, std::ranges::less(), [] (const auto &x) {return std::make_pair(x.id, x.ts);});
+    std::ranges::sort(sorted, std::ranges::less(), [] (const auto &x) {return std::make_pair(x.query(), x.ts);});
+    for (const auto &x : sorted) {
+        //fmt::print("{:016x} {}\n", x.query(), x) ;
+    }
+
+    struct query {
+        std::chrono::duration<double> latency;
+        uint64_t id;
+        std::chrono::duration<double> cputime;
+        std::chrono::duration<double> iotime;
+        std::chrono::duration<double> starvetime;
+    };
+    std::vector<query> queries;
+    {
+        uint64_t current_id = 0;
+        size_t i = 0;
+        while (i < sorted.size()) {
+            while (sorted[i].event != 1 && i < sorted.size()) {
+                ++i;
+            }
+            if (i == sorted.size()) {
+                break;
+            }
+            auto current_query = sorted[i].query();
+            auto start = sorted[i].ts;
+            while (i + 1 < sorted.size() && sorted[i + 1].query() == current_query) {
+                ++i;
+            }
+            auto end = sorted[i].ts;
+            auto time = std::chrono::duration<double, std::nano>(double(end - start) * MULTIPLIER);
+            queries.push_back(query{time, current_query});
+            ++i;
+        }
+    }
+    std::ranges::sort(queries, std::ranges::less(), [] (const auto &x) {return x.latency;});
+    for (const auto &x : queries) {
+        //fmt::print("{} {}\n", x.latency.count(), x.id) ;
+    }
+
+    {
+        for (auto &x : queries) {
+            auto id = x.id;
+            auto sorted_range = std::ranges::equal_range(sorted, id, std::ranges::less(), [] (const auto& e) {return e.query();});
+            //fmt::print("tsrange: {} {}\n", sorted_range.front().ts, sorted_range.back().ts);
+            auto span_range = std::ranges::equal_range(span, 1, std::ranges::less(), [&sorted_range] (const auto& e) {return (e.ts >= sorted_range.front().ts) + (e.ts > sorted_range.back().ts);});
+
+            uint64_t iostack = 0;
+            uint64_t iostart = 0;
+            bool cpu = true;
+            uint64_t prev_ts = sorted_range.begin()->ts;
+            uint64_t cputime = 0;
+            uint64_t starvetime = 0;
+            uint64_t iotime = 0;
+            size_t i;
+            //fmt::print("range: {} {}\n", span_range.begin() - span.begin(), span_range.end() - span.begin());
+            for (i = span_range.begin() - span.begin(); i < span_range.end() - span.begin(); ++i) {
+                //fmt::print("looping: {}\n", i);
+                uint64_t dt = span[i].ts - prev_ts;
+                if (iostack == 0 && !cpu) {
+                    starvetime += dt;
+                }
+                if (cpu) {
+                    cputime += dt;
+                }
+                if (iostack) {
+                    iotime += dt;
+                }
+                if (span[i].query() == id) {
+                    cpu = true;
+                    if (span[i].event == 0x4) {
+                        iostack += 1;
+                    } else if (span[i].event == 0x5) {
+                        iostack -= 1;
+                    }
+                } else {
+                    cpu = false;
+                }
+                prev_ts = span[i].ts;
+            }
+            if (i < span.size()) {
+                uint64_t end_ts = span[i].ts;
+                if (iostack) {
+                    iotime += end_ts - iostart;
+                }
+            }
+            auto conv = [] (uint64_t ticks) {
+                return std::chrono::duration<double, std::nano>(ticks * MULTIPLIER);
+            };
+            x.iotime = conv(iotime);
+            x.starvetime = conv(starvetime);
+            x.cputime = conv(cputime);
+            //fmt::print("cputime: {}", cputime);
+        }
+    }
+
+    std::vector<double> xx;
+    std::vector<double> yy;
+    if (queries.size()) {
+        for (int i = 0; i <= 1000; ++i) {
+            double x = pow(100000.0, i/1000.0);
+            size_t w = queries.size() - size_t(1.0 / x * queries.size());
+            xx.push_back(x);
+            yy.push_back(queries[std::clamp(w, size_t(0), queries.size() - 1)].latency.count());
+        }
+        for (size_t i = 0; i < xx.size(); ++i) {
+            //fmt::print("{} {}\n", xx[i], yy[i]);
+        }
+    }
+
+#if 0
+    {
+        double m_timerMul = 1.;
+
+        std::atomic_signal_fence( std::memory_order_acq_rel );
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        const auto r0 = rdtsc();
+        std::atomic_signal_fence( std::memory_order_acq_rel );
+        std::this_thread::sleep_for( std::chrono::milliseconds( 200 ) );
+        std::atomic_signal_fence( std::memory_order_acq_rel );
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const auto r1 = rdtsc();
+        std::atomic_signal_fence( std::memory_order_acq_rel );
+
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count();
+        const auto dr = r1 - r0;
+
+        m_timerMul = double( dt ) / double( dr );
+        fmt::print("dt: {}, dr: {}, MULT: {}\n", dt, dr, m_timerMul);
+    }
+#endif
 
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
         return 1;
 
-    // Decide GL+GLSL versions
-#if defined(IMGUI_IMPL_OPENGL_ES2)
-    // GL ES 2.0 + GLSL 100
-    const char* glsl_version = "#version 100";
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
-#elif defined(__APPLE__)
-    // GL 3.2 + GLSL 150
-    const char* glsl_version = "#version 150";
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);            // Required on Mac
-#else
     // GL 3.0 + GLSL 130
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    //glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
-    //glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);            // 3.0+ only
-#endif
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);            // 3.0+ only
 
     // Create window with graphics context
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Dear ImGui GLFW+OpenGL3 example", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Latency analyzer", nullptr, nullptr);
     if (window == nullptr)
         return 1;
     glfwMakeContextCurrent(window);
@@ -167,9 +283,11 @@ int main(int argc, char** argv)
         ImGui::NewFrame();
 
         // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
-        if (show_demo_window)
-            ImGui::ShowDemoWindow(&show_demo_window);
+        if (show_demo_window) {
+            // ImGui::ShowDemoWindow(&show_demo_window);
+        }
 
+#if 0
         // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
         {
             static float f = 0.0f;
@@ -270,10 +388,13 @@ int main(int argc, char** argv)
                 sprintf(buf, "%d/%d", (int)(progress_saturated * 1753), 1753);
                 ImGui::ProgressBar(progress, ImVec2(0.f, 0.f), buf);
             }
-            ImPlot::ShowDemoWindow();
             ImGui::End();
         }
+#endif
 
+        //ImPlot::ShowDemoWindow();
+
+#if 0
         // 3. Show another simple window.
         if (show_another_window)
         {
@@ -282,6 +403,237 @@ int main(int argc, char** argv)
             if (ImGui::Button("Close Me"))
                 show_another_window = false;
             ImGui::End();
+        }
+#endif
+
+        {
+            ImGui::Begin("Graph");
+            ImPlot::BeginPlot("HdrHistogram", ImVec2(-1,0));
+            ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_Lock, ImPlotAxisFlags_Lock);
+            ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+            ImPlot::SetupAxisScale(ImAxis_Y1, ImPlotScale_Log10);
+            ImPlot::SetupAxesLimits(1, 100000, 0.0001, queries.back().latency.count());
+            if (ImPlot::IsPlotSelected()) {
+                static ImPlotRect limits, select;
+                select = ImPlot::GetPlotSelection();
+            }
+            ImPlot::PlotLine("Latency", xx.data(), yy.data(), 1001);
+            static double line_x;
+            static size_t w = 0;
+            static uint64_t id_log = queries[w].id; 
+            static uint64_t id_full_log = id_log;
+
+            if (ImPlot::IsPlotHovered() && ImGui::IsMouseDown(0)) {
+                ImPlotPoint pt = ImPlot::GetPlotMousePos();
+                line_x = std::clamp(pt.x, 1.0, 100000.0);
+                w = std::clamp(queries.size() - size_t(1.0 / line_x * queries.size()), size_t(0), size_t(queries.size() - 1));
+                id_log = queries[w].id;
+                id_full_log = id_log;
+            }
+            ImPlotDragToolFlags flags = ImPlotDragToolFlags_NoCursors | ImPlotDragToolFlags_NoFit | ImPlotDragToolFlags_NoInputs;
+            ImPlot::DragLineX(0, &line_x, ImVec4(1,1,1,1), 1, flags);
+
+            static double rect[] = {100.0, 0.001, 141.2, 0.003};
+            ImPlot::DragRect(0,&rect[0],&rect[1],&rect[2],&rect[3],ImVec4(1,0,1,1));
+
+            ImPlot::EndPlot();
+
+            ImGui::End();
+
+            ImGui::Begin("TimeDist");
+            {
+                static size_t w1g = -1;
+                static size_t w2g = -1;
+                size_t w1 = std::clamp(queries.size() - size_t(1.0 / rect[0] * queries.size()), size_t(0), size_t(queries.size() - 1));
+                size_t w2 = std::clamp(queries.size() - size_t(1.0 / rect[2] * queries.size()), size_t(0), size_t(queries.size() - 1));
+                using t = std::chrono::duration<double>;
+                static std::vector<double> plot_x = std::invoke([&] {
+                    std::vector<double> v;
+                    for (int i = 0; i < 1024; ++i) {
+                        v.push_back(i * (1.0/1024));
+                    }
+                    return v;
+                });
+                static std::vector<double> iotimes_y, cputimes_y, latencies_y, starvetimes_y;
+                static t avgiotime, avgcputime, avgstarvetime, avglatency;
+
+                if (w1 != w1g || w2 != w2g) {
+                    w1g = w1;
+                    w2g = w2;
+                    avgiotime = avgcputime = avglatency = avgstarvetime = t::zero();
+                    std::vector<t> iotimes, cputimes, latencies, starvetimes;
+                    for (size_t i = w1; i <= w2; ++i) {
+                        avgiotime += queries[i].iotime / (w2 - w1 + 1);
+                        avgcputime += queries[i].cputime / (w2 - w1 + 1);
+                        avgstarvetime += queries[i].starvetime / (w2 - w1 + 1);
+                        avglatency += queries[i].latency / (w2 - w1 + 1);
+
+                        iotimes.push_back(queries[i].iotime);
+                        cputimes.push_back(queries[i].cputime);
+                        starvetimes.push_back(queries[i].starvetime);
+                        latencies.push_back(queries[i].latency);
+                    }
+                    std::ranges::sort(iotimes);
+                    std::ranges::sort(cputimes);
+                    std::ranges::sort(starvetimes);
+                    std::ranges::sort(latencies);
+
+                    auto sample = [&] (std::vector<t>& vec) {
+                        auto res = std::vector<double>();
+                        if (vec.empty()) {
+                            return res;
+                        }
+                        for (const auto& p : plot_x) {
+                            size_t ww = (vec.size() - 1) * p;
+                            res.push_back(std::chrono::duration<double, std::milli>(vec[ww]).count());
+                        }
+                        return res;
+                    };
+                    iotimes_y = sample(iotimes);
+                    starvetimes_y = sample(starvetimes);
+                    cputimes_y = sample(cputimes);
+                    latencies_y = sample(latencies);
+                }
+
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "CPU", std::chrono::duration<double, std::milli>(avgcputime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "STARVE", std::chrono::duration<double, std::milli>(avgstarvetime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "IO", std::chrono::duration<double, std::milli>(avgiotime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "TOTAL", std::chrono::duration<double, std::milli>(avglatency).count()).c_str());
+
+                if (ImPlot::BeginSubplots("My Subplot",2,2,ImVec2(-1, -1))) {
+                    if (ImPlot::BeginPlot("iotime cdf", ImVec2(-1,0))) {
+                        ImPlot::SetupAxes(NULL,NULL,0,ImPlotAxisFlags_AutoFit|ImPlotAxisFlags_RangeFit);
+                        ImPlot::PlotLine("iotime cdf", plot_x.data(), iotimes_y.data(), iotimes_y.size());
+                        ImPlot::EndPlot();
+                    }
+                    if (ImPlot::BeginPlot("starvetime cdf", ImVec2(-1,0))) {
+                        ImPlot::SetupAxes(NULL,NULL,0,ImPlotAxisFlags_AutoFit|ImPlotAxisFlags_RangeFit);
+                        ImPlot::PlotLine("starvetime cdf", plot_x.data(), starvetimes_y.data(), starvetimes_y.size());
+                        ImPlot::EndPlot();
+                    }
+                    if (ImPlot::BeginPlot("cputime cdf", ImVec2(-1,0))) {
+                        ImPlot::SetupAxes(NULL,NULL,0,ImPlotAxisFlags_AutoFit|ImPlotAxisFlags_RangeFit);
+                        ImPlot::PlotLine("cputime cdf", plot_x.data(), cputimes_y.data(), cputimes_y.size());
+                        ImPlot::EndPlot();
+                    }
+                    if (ImPlot::BeginPlot("latency cdf", ImVec2(-1,0))) {
+                        ImPlot::SetupAxes(NULL,NULL,0,ImPlotAxisFlags_AutoFit|ImPlotAxisFlags_RangeFit);
+                        ImPlot::PlotLine("latency cdf", plot_x.data(), latencies_y.data(), latencies_y.size());
+                        ImPlot::EndPlot();
+                    }
+                    ImPlot::EndSubplots();
+                }
+            }
+            ImGui::End();
+
+            {
+                ImGui::Begin("Log");
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "CPU", std::chrono::duration<double, std::milli>(queries[w].cputime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "STARVE", std::chrono::duration<double, std::milli>(queries[w].starvetime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "IO", std::chrono::duration<double, std::milli>(queries[w].iotime).count()).c_str());
+                ImGui::Text("%s", fmt::format("{:10s} {:12.9f}", "TOTAL", std::chrono::duration<double, std::milli>(queries[w].latency).count()).c_str());
+                uint64_t start = std::ranges::lower_bound(sorted, id_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin();
+                uint64_t end = std::ranges::upper_bound(sorted, id_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin() - 1;
+                uint64_t start_ts = sorted[start].ts;
+                uint64_t end_ts = sorted[end].ts;
+                static size_t selected = 0;
+                for (size_t i = start; i <= end; ++i) {
+                    auto dt_nano = std::chrono::duration<double, std::nano>(double(sorted[i].ts - start_ts) * MULTIPLIER);
+                    auto dt = std::chrono::duration<double, std::milli>(dt_nano);
+                    auto message = std::invoke([&] () -> std::string {
+                        const auto e = sorted[i];
+                        switch (e.event) {
+                        case 0: return fmt::format("{:10s}", "SWITCH");
+                        case 1: return "START";
+                        case 0xa: return "PERMIT";
+                        case 0xb: return "ES";
+                        case 0x3: {
+                        const char* rcs_status[] = {
+                        "admitted immediately",
+                        "queued because of non-empty ready",
+                        "queued because of used permits",
+                        "queued because of memory resources",
+                        "queued because of count resources",
+                        };
+                        return fmt::format("{:10s} {}", "RCS", rcs_status[e.arg]);
+                        }
+                        case 0x4: return fmt::format("{:10s} {:16x}", "IO_BEGIN", e.arg);
+                        case 0x5: return fmt::format("{:10s} {:16x}", "IO_END", e.arg);
+                        default: return fmt::format("UNKNOWN ({})", e.event);
+                        }
+                    });
+                    bool highlighted = (selected >= start && selected <= end) && (sorted[i].event == 0x4 || sorted[i].event == 0x5) && (sorted[i].arg == sorted[selected].arg);
+                    auto s = fmt::format("{:12.9f}: {}", dt.count(), message);
+                    if (ImGui::Selectable(s.c_str(), highlighted)) {
+                        if (highlighted) {
+                            selected = -1;
+                        } else {
+                            selected = i;
+                        }
+                    }
+                }
+                ImGui::End();
+            }
+#if 1
+            {
+                ImGui::Begin("Full log");
+                uint64_t start = std::ranges::lower_bound(sorted, id_full_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin();
+                uint64_t end = std::ranges::upper_bound(sorted, id_full_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin() - 1;
+                uint64_t start_ts = sorted[start].ts;
+                uint64_t end_ts = sorted[end].ts;
+                start = std::ranges::lower_bound(span, start_ts, std::ranges::less(), [] (const auto& e) {return e.ts;}) - span.begin();
+                end = std::ranges::lower_bound(span, end_ts, std::ranges::less(), [] (const auto& e) {return e.ts;}) - span.begin() - 1;
+                static size_t selected = 0;
+                for (size_t i = start; i <= end; ++i) {
+                    auto dt_nano = std::chrono::duration<double, std::nano>(double(span[i].ts - start_ts) * MULTIPLIER);
+                    auto dt = std::chrono::duration<double, std::milli>(dt_nano);
+                    auto message = std::invoke([&] () -> std::string {
+                        const auto e = span[i];
+                        switch (e.event) {
+                        case 0: return fmt::format("{:10s}", "SWITCH");
+                        case 1: return "START";
+                        case 0xa: return "PERMIT";
+                        case 0xb: return "ES";
+                        case 0x3: {
+                        const char* rcs_status[] = {
+                        "admitted immediately",
+                        "queued because of non-empty ready",
+                        "queued because of used permits",
+                        "queued because of memory resources",
+                        "queued because of count resources",
+                        };
+                        return fmt::format("{:10s} {}", "RCS", rcs_status[e.arg]);
+                        }
+                        case 0x4: return fmt::format("{:10s} {:16x}", "IO_BEGIN", e.arg);
+                        case 0x5: return fmt::format("{:10s} {:16x}", "IO_END", e.arg);
+                        default: return fmt::format("UNKNOWN ({})", e.event);
+                        }
+                    });
+                    //bool highlighted = (selected >= start && selected <= end) && (span[i].event == 0x4 || span[i].event == 0x5) && (span[i].arg == span[selected].arg);
+                    bool highlighted = (selected >= start && selected <= end) && (span[i].query() == id_log);
+                    auto s = fmt::format("{:12.9f}: {:16x}: {}", dt.count(), span[i].query(), message);
+                    bool is_active = span[i].query() == id_full_log;
+                    if (is_active) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 1.f, 0.24f, 1.f));
+                    }
+                    if (ImGui::Selectable(s.c_str(), highlighted)) {
+                        auto x = span[i].query();
+                        if (x) {
+                            id_log = x;
+                        }
+                        if (highlighted) {
+                            selected = -1;
+                        } else {
+                            selected = i;
+                        }
+                    }
+                    if (is_active) {
+                        ImGui::PopStyleColor();
+                    }
+                }
+                ImGui::End();
+            }
+#endif
         }
 
         // Rendering
