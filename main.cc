@@ -74,9 +74,11 @@ int main(int argc, char** argv) {
     auto span = std::span<const entry>(reinterpret_cast<const entry*>(memblock), n_entries);
     auto sorted = std::vector<entry>(span.begin(), span.end());
     std::ranges::sort(sorted, std::ranges::less(), [] (const auto &x) {return std::make_pair(x.query(), x.ts);});
+#if 0
     for (const auto &x : sorted) {
-        //fmt::print("{:016x} {}\n", x.query(), x) ;
+        fmt::print("{:016x} {}\n", x.query(), x) ;
     }
+#endif
 
     struct query {
         std::chrono::duration<double> latency;
@@ -87,7 +89,6 @@ int main(int argc, char** argv) {
     };
     std::vector<query> queries;
     {
-        uint64_t current_id = 0;
         size_t i = 0;
         while (i < sorted.size()) {
             while (sorted[i].event != 1 && i < sorted.size()) {
@@ -108,9 +109,11 @@ int main(int argc, char** argv) {
         }
     }
     std::ranges::sort(queries, std::ranges::less(), [] (const auto &x) {return x.latency;});
+#if 0
     for (const auto &x : queries) {
-        //fmt::print("{} {}\n", x.latency.count(), x.id) ;
+        fmt::print("{} {}\n", x.latency.count(), x.id) ;
     }
+#endif
 
     {
         for (auto &x : queries) {
@@ -120,7 +123,6 @@ int main(int argc, char** argv) {
             auto span_range = std::ranges::equal_range(span, 1, std::ranges::less(), [&sorted_range] (const auto& e) {return (e.ts >= sorted_range.front().ts) + (e.ts > sorted_range.back().ts);});
 
             uint64_t iostack = 0;
-            uint64_t iostart = 0;
             bool cpu = true;
             uint64_t prev_ts = sorted_range.begin()->ts;
             uint64_t cputime = 0;
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
             uint64_t iotime = 0;
             size_t i;
             //fmt::print("range: {} {}\n", span_range.begin() - span.begin(), span_range.end() - span.begin());
-            for (i = span_range.begin() - span.begin(); i < span_range.end() - span.begin(); ++i) {
+            for (i = span_range.begin() - span.begin(); i < size_t(span_range.end() - span.begin()); ++i) {
                 //fmt::print("looping: {}\n", i);
                 uint64_t dt = span[i].ts - prev_ts;
                 if (iostack == 0 && !cpu) {
@@ -141,7 +143,9 @@ int main(int argc, char** argv) {
                     iotime += dt;
                 }
                 if (span[i].query() == id) {
-                    cpu = true;
+                    if (span[i].event != 0x5) {
+                        cpu = true;
+                    }
                     if (span[i].event == 0x4) {
                         iostack += 1;
                     } else if (span[i].event == 0x5) {
@@ -151,12 +155,6 @@ int main(int argc, char** argv) {
                     cpu = false;
                 }
                 prev_ts = span[i].ts;
-            }
-            if (i < span.size()) {
-                uint64_t end_ts = span[i].ts;
-                if (iostack) {
-                    iotime += end_ts - iostart;
-                }
             }
             auto conv = [] (uint64_t ticks) {
                 return std::chrono::duration<double, std::nano>(ticks * MULTIPLIER);
@@ -257,18 +255,10 @@ int main(int argc, char** argv) {
 
     // Our state
     bool show_demo_window = true;
-    bool show_another_window = false;
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
     // Main loop
-#ifdef __EMSCRIPTEN__
-    // For an Emscripten build we are disabling file-system access, so let's not attempt to do a fopen() of the imgui.ini file.
-    // You may manually call LoadIniSettingsFromMemory() to load settings from your own storage.
-    io.IniFilename = nullptr;
-    EMSCRIPTEN_MAINLOOP_BEGIN
-#else
     while (!glfwWindowShouldClose(window))
-#endif
     {
         // Poll and handle events (inputs, window resize, etc.)
         // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
@@ -406,6 +396,11 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        static size_t chosen_one = -1;
+        static bool just_chosen = true;
+        static size_t chosen_unfull = -1;
+        static bool just_chosen_unfull = true;
+        static uint64_t id_log = queries[0].id;
         {
             ImGui::Begin("Graph");
             ImPlot::BeginPlot("HdrHistogram", ImVec2(-1,0));
@@ -420,7 +415,6 @@ int main(int argc, char** argv) {
             ImPlot::PlotLine("Latency", xx.data(), yy.data(), 1001);
             static double line_x;
             static size_t w = 0;
-            static uint64_t id_log = queries[w].id; 
             static uint64_t id_full_log = id_log;
 
             if (ImPlot::IsPlotHovered() && ImGui::IsMouseDown(0)) {
@@ -434,7 +428,9 @@ int main(int argc, char** argv) {
             ImPlot::DragLineX(0, &line_x, ImVec4(1,1,1,1), 1, flags);
 
             static double rect[] = {100.0, 0.001, 141.2, 0.003};
-            ImPlot::DragRect(0,&rect[0],&rect[1],&rect[2],&rect[3],ImVec4(1,0,1,1));
+            rect[1] = 0.0001;
+            rect[3] = 0.001;
+            ImPlot::DragRect(0,&rect[0],&rect[1],&rect[2],&rect[3],ImVec4(1,0,1,1), ImPlotDragToolFlags_Delayed);
 
             ImPlot::EndPlot();
 
@@ -535,7 +531,7 @@ int main(int argc, char** argv) {
                 uint64_t start = std::ranges::lower_bound(sorted, id_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin();
                 uint64_t end = std::ranges::upper_bound(sorted, id_log, std::ranges::less(), [] (const auto& e) {return e.query();}) - sorted.begin() - 1;
                 uint64_t start_ts = sorted[start].ts;
-                uint64_t end_ts = sorted[end].ts;
+                //uint64_t end_ts = sorted[end].ts;
                 static size_t selected = 0;
                 for (size_t i = start; i <= end; ++i) {
                     auto dt_nano = std::chrono::duration<double, std::nano>(double(sorted[i].ts - start_ts) * MULTIPLIER);
@@ -564,12 +560,22 @@ int main(int argc, char** argv) {
                     });
                     bool highlighted = (selected >= start && selected <= end) && (sorted[i].event == 0x4 || sorted[i].event == 0x5) && (sorted[i].arg == sorted[selected].arg);
                     auto s = fmt::format("{:12.9f}: {}", dt.count(), message);
+                    if (i == chosen_unfull) {
+                        if (just_chosen_unfull) {
+                            just_chosen_unfull = false;
+                            ImGui::SetScrollHereY();
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.f, 0.0f, 1.f));
+                    }
                     if (ImGui::Selectable(s.c_str(), highlighted)) {
                         if (highlighted) {
                             selected = -1;
                         } else {
                             selected = i;
                         }
+                    }
+                    if (i == chosen_unfull) {
+                        ImGui::PopStyleColor();
                     }
                 }
                 ImGui::End();
@@ -616,6 +622,13 @@ int main(int argc, char** argv) {
                     if (is_active) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 1.f, 0.24f, 1.f));
                     }
+                    if (i == chosen_one) {
+                        if (just_chosen) {
+                            just_chosen = false;
+                            ImGui::SetScrollHereY();
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.f, 0.0f, 1.f));
+                    }
                     if (ImGui::Selectable(s.c_str(), highlighted)) {
                         auto x = span[i].query();
                         if (x) {
@@ -627,6 +640,9 @@ int main(int argc, char** argv) {
                             selected = i;
                         }
                     }
+                    if (i == chosen_one) {
+                        ImGui::PopStyleColor();
+                    }
                     if (is_active) {
                         ImGui::PopStyleColor();
                     }
@@ -634,6 +650,76 @@ int main(int argc, char** argv) {
                 ImGui::End();
             }
 #endif
+            {
+                ImGui::Begin("Full log plot");
+                if (ImPlot::BeginPlot("Full log plot", ImVec2(-1, 100), ImPlotFlags_NoTitle)) {
+                    static uint64_t prev_id;
+                    auto flag = prev_id == id_full_log ? ImPlotCond_Once : ImPlotCond_Always;
+                    prev_id = id_full_log;
+
+                    auto sorted_range = std::ranges::equal_range(sorted, id_full_log, std::ranges::less(), [] (const auto& e) {return e.query();});
+                    auto span_range = std::ranges::equal_range(span, 1, std::ranges::less(), [&sorted_range] (const auto& e) {return (e.ts >= sorted_range.front().ts) + (e.ts > sorted_range.back().ts);});
+
+                    uint64_t start_ts = sorted_range.front().ts;
+                    uint64_t end_ts = sorted_range.back().ts;
+                    ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoGridLines, ImPlotAxisFlags_Lock | ImPlotAxisFlags_NoDecorations);
+                    ImPlot::SetupAxisLimitsConstraints(ImAxis_X1, 0, double(end_ts - start_ts)*MULTIPLIER/1e6);
+                    ImPlot::SetupAxesLimits(0, double(end_ts - start_ts)*MULTIPLIER/1e6, 0, 1, flag);
+                    ImPlot::PushPlotClipRect();
+
+                    uint64_t prev_ts = start_ts;
+                    bool cpu = true;
+                    uint64_t iostack = 0;
+                    uint64_t iostart = 0;
+                    for (const auto& x : span_range) {
+                            ImVec2 rmin = ImPlot::PlotToPixels(ImPlotPoint(double(prev_ts - start_ts)*MULTIPLIER/1e6, 1.f));
+                            ImVec2 rmax = ImPlot::PlotToPixels(ImPlotPoint(double(x.ts - start_ts)*MULTIPLIER/1e6, 0.f));
+                            ImVec2 rmin_low = ImPlot::PlotToPixels(ImPlotPoint(double(prev_ts - start_ts)*MULTIPLIER/1e6, 0.f));
+                        if (cpu) {
+                            ImPlot::GetPlotDrawList()->AddLine(rmin, rmin_low, IM_COL32(0,128,0,255));
+                            ImPlot::GetPlotDrawList()->AddRectFilled(rmin, rmax, IM_COL32(0,128,0,255));
+                        } else {
+                            ImPlot::GetPlotDrawList()->AddRectFilled(rmin, rmax, IM_COL32(0,0,128,32));
+                        }
+                        if (x.query() == id_full_log) {
+                            if (x.event != 0x5) {
+                                cpu = true;
+                            }
+                            if (x.event == 0x4) {
+                                if (iostack == 0) {
+                                    iostart = x.ts;
+                                }
+                                iostack += 1;
+                            } else if (x.event == 0x5) {
+                                iostack -= 1;
+                                if (iostack == 0) {
+                                    ImVec2 rmin = ImPlot::PlotToPixels(ImPlotPoint(double(iostart - start_ts)*MULTIPLIER/1e6, 1.f));
+                                    ImVec2 rmax = ImPlot::PlotToPixels(ImPlotPoint(double(x.ts - start_ts)*MULTIPLIER/1e6, 0.f));
+                                    ImPlot::GetPlotDrawList()->AddRectFilled(rmin, rmax, IM_COL32(255,255,255,32));
+                                }
+                            }
+                        } else {
+                            cpu = false;
+                        }
+                        prev_ts = x.ts;
+                    }
+                    ImPlot::PopPlotClipRect();
+
+                    if (ImPlot::IsPlotHovered() && ImGui::IsMouseDown(0)) {
+                        ImPlotPoint pt = ImPlot::GetPlotMousePos();
+                        uint64_t ts = start_ts + pt.x * 1e6 / MULTIPLIER;
+                        chosen_one = std::ranges::lower_bound(span, ts, std::ranges::less(), [] (const auto& e) {return e.ts;}) - span.begin() - 1;
+                        chosen_one = std::clamp(chosen_one, size_t(0), span.size() - 1);
+                        just_chosen = true;
+                        chosen_unfull = std::ranges::lower_bound(sorted, std::make_pair<uint64_t, uint64_t>(uint64_t(id_log), uint64_t(ts)), std::ranges::less(), [] (const auto& e) {return std::make_pair<uint64_t, uint64_t>(e.query(), e.ts);}) - sorted.begin() - 1;
+                        chosen_unfull = std::clamp(chosen_unfull, size_t(0), sorted.size() - 1);
+                        just_chosen_unfull = true;
+                    }
+                    ImPlot::EndPlot();
+                }
+                ImGui::End();
+            }
+
         }
 
         // Rendering
@@ -647,9 +733,6 @@ int main(int argc, char** argv) {
 
         glfwSwapBuffers(window);
     }
-#ifdef __EMSCRIPTEN__
-    EMSCRIPTEN_MAINLOOP_END;
-#endif
 
     // Cleanup
     ImGui_ImplOpenGL3_Shutdown();
