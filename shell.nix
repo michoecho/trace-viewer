@@ -1,8 +1,10 @@
 { pkgs ? import <nixpkgs> {} }:
 
-pkgs.mkShell {
+#(pkgs.overrideCC pkgs.stdenv (pkgs.ccacheWrapper.override { cc = pkgs.clang_15; })).mkDerivation {
+pkgs.ccacheStdenv.mkDerivation {
   name = "Scylla trace viewer";
   buildInputs = with pkgs; [
+    ccache
     imgui
     glfw
     SDL2
